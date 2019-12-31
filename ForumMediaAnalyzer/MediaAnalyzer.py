@@ -7,6 +7,7 @@ import requests
 import numpy as np
 from datetime import datetime
 
+import pytz
 import gridfs
 import pymongo
 from pymongo import MongoClient
@@ -51,6 +52,7 @@ class MediaAnalyzer(object):
 
         self.scraper_rest_host = scraper_rest_host
         self.document_retrieval_batch_size = document_retrieval_batch_size
+        self.timezone = pytz.timezone('Europe/Berlin')
 
         # create database related objects
         self._mongo_client = MongoClient(mongo_uri)
@@ -69,6 +71,9 @@ class MediaAnalyzer(object):
         if not self._mongo_database['Counter'].find_one():
             self._mongo_database['Counter'].insert_one({'_id': 'OrderNum', 'val': 1})
 
+    def _get_tz_date(self):
+        return datetime.utcnow().replace(tzinfo=pytz.utc).astimezone(self.timezone)
+
     @staticmethod
     def _scale_images(image_one: np.ndarray, image_two: np.ndarray, scale_percent_dif: float=0.02):
         # Scale the images so that they have the same
@@ -77,10 +82,10 @@ class MediaAnalyzer(object):
         if image_one.shape == image_two.shape:
             return image_one, image_two
 
-        if abs((image_one[0] / image_one[1]) - (image_two[0] / image_two[1])) >= scale_percent_dif:
+        if abs((image_one.shape[0] / image_one.shape[1]) - (image_two.shape[0] / image_two.shape[1])) >= scale_percent_dif:
             return None, None
 
-        if sum(image_one[:2]) > sum(image_two[:2]):
+        if sum(image_one.shape[:2]) > sum(image_two.shape[:2]):
             image_one = cv2.resize(
                 src=image_one,
                 dsize=(image_two.shape[1], image_two.shape[0]),
@@ -144,7 +149,7 @@ class MediaAnalyzer(object):
             """
             last_article = self._mongo_database['Posts'].find_one(sort=[("OrderNum", pymongo.ASCENDING)])
             run = self._mongo_database['Runs'].insert_one({
-                'StartProcessTime': datetime.utcnow(),
+                'StartProcessTime': self._get_tz_date(),
                 'EndProcessTime': None,
                 'PostsProcessed': 0,
                 'BatchesProcessed': 0
@@ -152,7 +157,6 @@ class MediaAnalyzer(object):
             request_offset = 0
             final_batch = False
             last_article_found = False
-            save_all = False if last_article else True
             posts_processed = 0
             batches_processed = 0
 
@@ -164,7 +168,7 @@ class MediaAnalyzer(object):
                 resp.raise_for_status()
                 data = resp.json()
                 self.logger.debug('%s: Received new batch of data at %s using offset %d and limit %d' % (
-                    str(run.inserted_id), datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"), request_offset, self.document_retrieval_batch_size))
+                    str(run.inserted_id), self._get_tz_date().strftime("%Y-%m-%d %H:%M:%S"), request_offset, self.document_retrieval_batch_size))
 
                 if len(data['documents']) == 0:
                     self.logger.debug('%s: No more documents returned by %s using offset %d and limit %d' % (
@@ -185,114 +189,100 @@ class MediaAnalyzer(object):
                     batches_processed += 1
                     continue
 
-                if save_all:
-                    for doc in [doc for doc in data['documents'] if len(doc['Posts']) != 0]:
-                        for post in doc['Posts']:
-                            s = str(post['MediaData'])
-                            d = base64.b64decode(s.encode('utf-8'))
-                            buff = np.asarray(bytearray(d), dtype=np.uint8)
-                            im = cv2.imdecode(buff, cv2.IMREAD_GRAYSCALE)
-                            media_id = self.gridfs.put(d)
-                            order_num = self._mongo_database['Counter'].find_one().get('val')
-                            md = {
-                                "ArticleId": str(post['ArticleId']),
-                                "OrderNum": int(order_num),
-                                "RunId": run.inserted_id,
-                                "PostProcessedTime": datetime.utcnow(),
-                                "Dim": im.shape,
-                                "Media": media_id,
-                                "IsOriginal": True,
-                                "RepostOff": None,
-                                "Reposts": []
-                            }
-                            self._mongo_database['Posts'].insert_one(md)
-                            self._mongo_database['Counter'].update({'_id': 'OrderNum'}, {'$inc': {'val': 1}})
-                            posts_processed += 1
-
-                else:
-                    for doc in [doc for doc in data['documents'] if len(doc['Posts']) != 0]:
+                for doc in [doc for doc in data['documents'] if len(doc['Posts']) != 0]:
+                    if last_article:
                         if last_article['ArticleId'] == doc['StartPostId'] or last_article_found:
                             self.logger.debug('%s: Last article %s found at offset %d with limit %d' % (
                                 str(run.inserted_id), str(last_article['ArticleId']), request_offset, self.document_retrieval_batch_size))
                             final_batch = True
                             break
 
-                        for post in doc['Posts']:
+                    self.logger.info('%s: %d posts found for processing in document %s' % (
+                        str(run.inserted_id), len(doc['Posts']), doc['_id']))
+                    processed_posts = self._mongo_database['Posts'].find({})
+
+                    for post in doc['Posts']:
+                        if last_article:
                             if last_article['ArticleId'] == post['ArticleId']:
                                 self.logger.debug('%s: Last article %s found at offset %d with limit %d' % (
                                     str(run.inserted_id), str(last_article['ArticleId']), request_offset, self.document_retrieval_batch_size))
                                 last_article_found = True
                                 break
 
-                            s = str(post['MediaData'])
-                            d = base64.b64decode(s.encode('utf-8'))
-                            buff = np.asarray(bytearray(d), dtype=np.uint8)
-                            im = cv2.imdecode(buff, cv2.IMREAD_GRAYSCALE)
-                            media_id = self.gridfs.put(d)
-                            md = {
-                                "ArticleId": str(post['ArticleId']),
-                                "RunId": run.inserted_id,
-                                "PostProcessedTime": datetime.utcnow(),
-                                "Dim": im.shape,
-                                "MediaId": media_id,
-                                "IsOriginal": True,
-                                "RepostOff": None,
-                                "Reposts": []
-                            }
-                            processed_posts = self._mongo_database['Posts'].find({})
+                        im_s = str(post['MediaData'])
+                        im_b = base64.b64decode(im_s.encode('utf-8'))
+                        im_buff = np.asarray(bytearray(im_b), dtype=np.uint8)
+                        im = cv2.imdecode(im_buff, cv2.IMREAD_GRAYSCALE)
+                        media_id = self.gridfs.put(im_b)
+                        md = {
+                            "ArticleId": str(post['ArticleId']),
+                            "RunId": run.inserted_id,
+                            "PostProcessedTime": self._get_tz_date(),
+                            "Dim": im.shape,
+                            "MediaId": media_id,
+                            "IsOriginal": True,
+                            "RepostOff": None,
+                            "Reposts": []
+                        }
 
-                            for pp in processed_posts:
-                                f = self.gridfs.get(pp['MediaId'])
-                                buff = np.asarray(bytearray(f.read(size=-1)), dtype=np.uint8)
-                                im0 = cv2.imdecode(buff, cv2.IMREAD_GRAYSCALE)
-                                im, im0 = self._scale_images(im, im0)
-                                if not im:
-                                    # images could not be scaled since difference in dimensions
-                                    # is too big. Must be unique based on this
-                                    continue
+                        for pp in processed_posts:
+                            f = self.gridfs.get(pp['MediaId'])
+                            im1_buff = np.asarray(bytearray(f.read(size=-1)), dtype=np.uint8)
+                            im1 = cv2.imdecode(im1_buff, cv2.IMREAD_GRAYSCALE)
+                            im0, im1 = self._scale_images(im, im1)
+                            if not hasattr(im0, "shape"):
+                                # images could not be scaled since difference in dimensions
+                                # is too big. Must be unique based on this
+                                continue
 
-                                mse = self._mse(im, im0)
-                                ss = structural_similarity(im, im0)
-                                hs = self._img_hash(im, im0)
+                            mse = self._mse(im0, im1)
+                            ss = structural_similarity(im0, im1)
+                            hs = self._img_hash(im0, im1)
 
-                                # The hash similarity will determine if an image is even close to being
-                                # similar to the processed image. The structural similarity measure will
-                                # then decide if this is actually correct. A last check is done to make
-                                # sure that its not a meme that is posted with the same background but
-                                # with different text using the very sensitive mse measure
-                                if hs == 0:
-                                    if ss >= 0.75:
-                                        if not mse >= 2000.00 and pp['IsOriginal']:
-                                            # db image seems to be very similar to the processed image
-                                            md.update({"IsOriginal": False, "RepostOff": pp['_id'], "Reposts": None})
-                                            pp['Reposts'].append({
-                                                "ArticleId": md['ArticleId'],
-                                                "mse": mse,
-                                                "ssim": ss,
-                                                "hs": hs,
-                                                "certainty": 1
-                                            })
-                                            self._mongo_database['Posts'].replace_one({"_id": pp['_id']}, pp)
-                                        else:
-                                            # image background might be the same with different text
-                                            continue
+                            # The hash similarity will determine if an image is even close to being
+                            # similar to the processed image. The structural similarity measure will
+                            # then decide if this is actually correct. A last check is done to make
+                            # sure that its not a meme that is posted with the same background but
+                            # with different text using the very sensitive mse measure
+                            if hs == 0:
+                                if ss >= 0.75:
+                                    if not mse >= 2000.00 and pp['IsOriginal']:
+                                        # db image seems to be very similar to the processed image
+                                        md.update({"IsOriginal": False, "RepostOff": pp['_id'], "Reposts": None})
+                                        pp['Reposts'].append({
+                                            "ArticleId": md['ArticleId'],
+                                            "mse": mse,
+                                            "ssim": ss,
+                                            "hs": hs,
+                                            "certainty": 1
+                                        })
+                                        self._mongo_database['Posts'].replace_one({"_id": pp['_id']}, pp)
                                     else:
-                                        # structural similarity is too far off must be unique
+                                        # image background might be the same with different text
                                         continue
                                 else:
-                                    # images are not similar at all
+                                    # structural similarity is too far off must be unique
                                     continue
+                            else:
+                                # images are not similar at all
+                                continue
 
-                            # insert data into mongo
-                            self._mongo_database['Posts'].insert_one(md)
+                        self._mongo_database['Posts'].insert_one(md)
+                        posts_processed += 1
 
                 if final_batch:
                     break
 
                 request_offset += self.document_retrieval_batch_size
+                batches_processed += 1
 
-        except requests.exceptions.RequestException as re:
-            raise AnalyzeConditionsNotMetException({'message': re})
+            self.logger.info('%s: Finished final batch. %d posts processed' % (str(run.inserted_id), posts_processed))
+            self._mongo_database['Runs'].update_one({'_id': run.inserted_id}, {
+                "$set": {'PostsProcessed': posts_processed, 'EndProcessTime': self._get_tz_date()}
+            })
+
+        except requests.exceptions.RequestException as ree:
+            raise AnalyzeConditionsNotMetException({'message': ree})
         except MongoServerSelectionTimeoutError as msste:
             raise AnalyzeConditionsNotMetException({'message': msste})
         except json.JSONDecodeError as je:
