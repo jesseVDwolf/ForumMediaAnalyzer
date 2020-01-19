@@ -82,7 +82,10 @@ class MediaAnalyzer(object):
         if image_one.shape == image_two.shape:
             return image_one, image_two
 
-        if abs((image_one.shape[0] / image_one.shape[1]) - (image_two.shape[0] / image_two.shape[1])) >= scale_percent_dif:
+        # use aspect ratio to determine if images can be rescaled
+        *_, w1, h1 = cv2.boundingRect(image_one)
+        *_, w2, h2 = cv2.boundingRect(image_two)
+        if abs((float(w1) / h1) - (float(w2) / h2)) >= scale_percent_dif:
             return None, None
 
         if sum(image_one.shape[:2]) > sum(image_two.shape[:2]):
@@ -226,6 +229,11 @@ class MediaAnalyzer(object):
                         }
 
                         for pp in processed_posts:
+                            if post['ArticleId'] == pp['ArticleId']:
+                                # duplicates will always be exactly the same
+                                # solution to a bug in the MediaScraper...
+                                continue
+
                             f = self.gridfs.get(pp['MediaId'])
                             im1_buff = np.asarray(bytearray(f.read(size=-1)), dtype=np.uint8)
                             im1 = cv2.imdecode(im1_buff, cv2.IMREAD_GRAYSCALE)
@@ -245,7 +253,7 @@ class MediaAnalyzer(object):
                             # sure that its not a meme that is posted with the same background but
                             # with different text using the very sensitive mse measure
                             if hs == 0:
-                                if ss >= 0.75:
+                                if ss >= 0.65:
                                     if not mse >= 2000.00 and pp['IsOriginal']:
                                         # db image seems to be very similar to the processed image
                                         md.update({"IsOriginal": False, "RepostOff": pp['_id'], "Reposts": None})
